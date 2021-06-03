@@ -24,6 +24,9 @@ import {
   QueryPlanFieldNode,
   getResponseName
 } from '@apollo/query-planner';
+
+import crypto from 'crypto';
+
 import { deepMerge } from './utilities/deepMerge';
 import { isNotNullOrUndefined } from './utilities/array';
 
@@ -41,45 +44,12 @@ interface ExecutionContext<TContext> {
   errors: GraphQLError[];
 }
 
-export async function executeQueryPlan<TContext>(
-  queryPlan: QueryPlan,
-  serviceMap: ServiceMap,
-  requestContext: GraphQLRequestContext<TContext>,
+
+async function gqlExecute<TContext>(
+  data: ResultMap | undefined | null,
   operationContext: OperationContext,
-): Promise<GraphQLExecutionResult> {
-  const errors: GraphQLError[] = [];
-
-  const context: ExecutionContext<TContext> = {
-    queryPlan,
-    operationContext,
-    serviceMap,
-    requestContext,
-    errors,
-  };
-
-  let data: ResultMap | undefined | null = Object.create(null);
-
-  const captureTraces = !!(
-    requestContext.metrics && requestContext.metrics.captureTraces
-  );
-
-  if (queryPlan.node) {
-    const traceNode = await executeNode(
-      context,
-      queryPlan.node,
-      data!,
-      [],
-      captureTraces,
-    );
-    if (captureTraces) {
-      requestContext.metrics!.queryPlanTrace = traceNode;
-    }
-  }
-
-  // FIXME: Re-executing the query is a pretty heavy handed way of making sure
-  // only explicitly requested fields are included and field ordering follows
-  // the original query.
-  // It is also used to allow execution of introspection queries though.
+  requestContext: GraphQLRequestContext<TContext>,
+): Promise<{ errors: unknown[]}|unknown> {
   try {
     ({ data } = await execute({
       schema: operationContext.schema,
@@ -95,11 +65,128 @@ export async function executeQueryPlan<TContext>(
       // See also `wrapSchemaWithAliasResolver` in `gateway-js/src/index.ts`.
       fieldResolver: defaultFieldResolverWithAliasSupport,
     }));
-  } catch (error) {
-    return { errors: [error] };
+    return data;
+  } catch (e) {
+    return { errors: [e] };
   }
+}
 
-  return errors.length === 0 ? { data } : { errors, data };
+
+export async function executeQueryPlan<TContext>(
+  queryPlan: QueryPlan,
+  serviceMap: ServiceMap,
+  requestContext: GraphQLRequestContext<TContext>,
+  operationContext: OperationContext,
+): Promise<GraphQLExecutionResult> {
+
+  return new Promise(async (res) => {
+    const errors: GraphQLError[] = [];
+
+    const context: ExecutionContext<TContext> = {
+      queryPlan,
+      operationContext,
+      serviceMap,
+      requestContext,
+      errors,
+    };
+
+    let data: ResultMap | undefined | null = Object.create(null);
+
+    const captureTraces = !!(
+      requestContext.metrics && requestContext.metrics.captureTraces
+    );
+
+    let hasTimedOut = false;
+    const CACHE_KEY = "cache_id";
+    const CACHE_ID = crypto.randomBytes(20).toString('hex');
+
+    const timeoutMS = Number(requestContext.request.http?.headers.get('timeout-ms')) || 3500;
+
+    (async function invokeQueryPlansWithTimeOut(){
+
+      const timeOutID = setTimeout(async () => {
+        hasTimedOut = true;
+        requestContext.response?.http?.headers.set(CACHE_KEY, CACHE_ID);
+        requestContext.response?.http?.headers.set('partial-resp', "true");
+        await gqlExecute(data, operationContext, requestContext);
+        console.log("XXXX: Time out, Sending partial response");
+        return errors.length === 0 ? res({ data }) : res({ errors, data });
+      }, timeoutMS);
+
+      if (queryPlan.node) {
+        const traceNode = await executeNode(
+          context,
+          queryPlan.node,
+          data!,
+          [],
+          captureTraces,
+        );
+        if (captureTraces) {
+          requestContext.metrics!.queryPlanTrace = traceNode;
+        }
+      }
+
+      /**
+       * INFO: got complete response
+       * 1. check if the timed out
+       * 2. Yes: save the response in the cache
+       * 3. No: Cancel the timer
+       *        send the complete response without saving the response into the cache
+       *
+       *
+       */
+
+      if (!hasTimedOut) {
+        // Send full response, there is no breach in SLA
+        console.log("XXXX: !Time out, Got full response within the timeout");
+        // INFO: clear the timer
+        clearTimeout(timeOutID);
+        // INFO: call graphql's execute function
+        await gqlExecute(data, operationContext, requestContext);
+        console.log("XXXX: !Time out, Sending full response");
+        return errors.length === 0 ? res({ data }) : res({ errors, data });
+      }
+
+      // INFO: timed out
+      // INFO: Save data into the cache
+      console.log("XXXX: After timeout, got full response");
+      await gqlExecute(data, operationContext, requestContext);
+      console.log("XXXX: After timeout, got full response, Setting cache");
+
+      // @ts-ignore
+      const { err } = await requestContext.context?.request?.setCache(CACHE_ID, data) || {};
+      if (err) console.log("XXXX: ", `Failed to save in cache: ${CACHE_KEY}: ${CACHE_ID}`)
+
+    })();
+
+
+
+    // FIXME: Re-executing the query is a pretty heavy handed way of making sure
+    // only explicitly requested fields are included and field ordering follows
+    // the original query.
+    // It is also used to allow execution of introspection queries though.
+    // try {
+    //   ({ data } = await execute({
+    //     schema: operationContext.schema,
+    //     document: {
+    //       kind: Kind.DOCUMENT,
+    //       definitions: [
+    //         operationContext.operation,
+    //         ...Object.values(operationContext.fragments),
+    //       ],
+    //     },
+    //     rootValue: data,
+    //     variableValues: requestContext.request.variables,
+    //     // See also `wrapSchemaWithAliasResolver` in `gateway-js/src/index.ts`.
+    //     fieldResolver: defaultFieldResolverWithAliasSupport,
+    //   }));
+    // } catch (error) {
+    //   // INFO: this error sits inside the data
+    //   return { errors: [error] };
+    // }
+
+    // return errors.length === 0 ? res({ data }) : res({ errors, data });
+  });
 }
 
 // Note: this function always returns a protobuf QueryPlanNode tree, even if
